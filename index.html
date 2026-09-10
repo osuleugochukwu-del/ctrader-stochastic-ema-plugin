@@ -1,0 +1,291 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Stochastic EMA Sequential Signal — cTrader Web Plugin</title>
+<style>
+  html,body{margin:0;height:100%;font-family:Arial,Helvetica,sans-serif;background:#101418;color:#e8edf2}
+  #app{height:100%;display:flex;flex-direction:column;overflow:hidden}
+  .top{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px;background:#171d23;border-bottom:1px solid #303840}
+  .top b{margin-right:8px}.top label{font-size:12px;color:#aeb8c2}
+  input,select,button{background:#0e1317;color:#e8edf2;border:1px solid #39434d;border-radius:4px;padding:5px 7px}
+  input{width:54px}.symbol{width:90px}.status{margin-left:auto;font-size:12px;color:#7fd38b}
+  #chart{flex:1;min-height:0;position:relative}
+  canvas{width:100%;height:100%;display:block}
+  .bottom{padding:6px 10px;background:#171d23;border-top:1px solid #303840;font-size:12px;display:flex;gap:18px}
+  .buy{color:#7CFF8B}.sell{color:#FF6B6B}.muted{color:#98a3ad}
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="top">
+    <b>Stochastic EMA Sequential</b>
+    <label>Symbol <input id="symbol" class="symbol" value="EURUSD"></label>
+    <label>TF
+      <select id="tf">
+        <option value="M1">M1</option><option value="M5">M5</option><option value="M15" selected>M15</option>
+        <option value="M30">M30</option><option value="H1">H1</option><option value="H4">H4</option>
+        <option value="D1">D1</option>
+      </select>
+    </label>
+    <label>K <input id="kPeriod" value="20"></label>
+    <label>Slow <input id="kSlow" value="7"></label>
+    <label>D <input id="dPeriod" value="7"></label>
+    <label>OB <input id="ob" value="80"></label>
+    <label>OS <input id="os" value="20"></label>
+    <label>EMA <input id="ema" value="10"></label>
+    <label>Trend EMA <input id="trendEma" value="300"></label>
+    <label>Seq <input id="maxSeq" value="100"></label>
+    <label>To EMA <input id="maxEma" value="100"></label>
+    <label>Trend <select id="useTrend"><option value="1" selected>ON</option><option value="0">OFF</option></select></label>
+    <button id="reload">Load</button>
+    <span id="status" class="status">Connecting…</span>
+  </div>
+  <div id="chart"><canvas id="cv"></canvas></div>
+  <div class="bottom">
+    <span class="buy" id="buyText">BUY: 0</span>
+    <span class="sell" id="sellText">SELL: 0</span>
+    <span class="muted" id="info">Waiting for cTrader data…</span>
+  </div>
+</div>
+
+<script type="module">
+import { createClientAdapter } from "https://esm.sh/@spotware-web-team/sdk-external-api";
+import {
+  handleConfirmEvent, registerEvent, getLightSymbolList, getSymbol,
+  getTrendbarList
+} from "https://esm.sh/@spotware-web-team/sdk";
+import { take, tap, catchError } from "https://esm.sh/rxjs";
+
+const adapter = createClientAdapter({});
+let connected = false;
+let symbols = [];
+let bars = [];
+let signals = [];
+let symbolInfo = null;
+let timer = null;
+
+const $ = id => document.getElementById(id);
+const cv = $("cv");
+const ctx = cv.getContext("2d");
+
+function n(id, fallback){ const x=Number($(id).value); return Number.isFinite(x)?x:fallback; }
+
+function sma(a, p, i){
+  if(i-p+1<0) return NaN;
+  let s=0;
+  for(let j=i-p+1;j<=i;j++) s+=a[j];
+  return s/p;
+}
+function emaSeries(a,p){
+  const out=new Array(a.length).fill(NaN);
+  const k=2/(p+1);
+  let prev=NaN;
+  for(let i=0;i<a.length;i++){
+    if(!Number.isFinite(a[i])) continue;
+    if(!Number.isFinite(prev)) prev=a[i];
+    else prev=a[i]*k+prev*(1-k);
+    out[i]=prev;
+  }
+  return out;
+}
+function stochastic(bars,kp,slow,dp){
+  const raw=bars.map((b,i)=>{
+    if(i<kp-1) return NaN;
+    let lo=Infinity,hi=-Infinity;
+    for(let j=i-kp+1;j<=i;j++){lo=Math.min(lo,b.low);hi=Math.max(hi,b.high);}
+    return hi===lo?50:100*(b.close-lo)/(hi-lo);
+  });
+  const k=raw.map((_,i)=>sma(raw,slow,i));
+  const d=k.map((_,i)=>sma(k,dp,i));
+  return {k,d};
+}
+function calculate(){
+  const kp=n("kPeriod",20), slow=n("kSlow",7), dp=n("dPeriod",7);
+  const ob=n("ob",80), os=n("os",20), ep=n("ema",10), tep=n("trendEma",300);
+  const maxSeq=n("maxSeq",100), maxTo=n("maxEma",100), useTrend=$("useTrend").value==="1";
+  const closed = bars.slice(0,-1); // Closed-candle-only behavior
+  if(closed.length < Math.max(kp+slow+dp,tep)+5){ signals=[]; return; }
+
+  const {k,d}=stochastic(closed,kp,slow,dp);
+  const ema=emaSeries(closed.map(x=>x.close),ep);
+  const trend=emaSeries(closed.map(x=>x.close),tep);
+  const buySetups=[], sellSetups=[], out=[];
+  let kOS=false,dOS=false,kOB=false,dOB=false,osStart=-1,obStart=-1;
+
+  for(let i=1;i<closed.length;i++){
+    if(!Number.isFinite(k[i-1])||!Number.isFinite(k[i])||!Number.isFinite(d[i-1])||!Number.isFinite(d[i])) continue;
+
+    const kCrossOS=k[i-1]>os && k[i]<=os;
+    const dCrossOS=d[i-1]>os && d[i]<=os;
+    const kCrossOB=k[i-1]<ob && k[i]>=ob;
+    const dCrossOB=d[i-1]<ob && d[i]>=ob;
+
+    if(kCrossOS){kOS=true;if(osStart<0)osStart=i}
+    if(dCrossOS){dOS=true;if(osStart<0)osStart=i}
+    if(kCrossOB){kOB=true;if(obStart<0)obStart=i}
+    if(dCrossOB){dOB=true;if(obStart<0)obStart=i}
+
+    if(osStart>=0 && i-osStart>maxSeq){kOS=dOS=false;osStart=-1}
+    if(obStart>=0 && i-obStart>maxSeq){kOB=dOB=false;obStart=-1}
+
+    const bull=k[i-1]<=d[i-1] && k[i]>d[i];
+    const bear=k[i-1]>=d[i-1] && k[i]<d[i];
+
+    if(kOS&&dOS&&bull){
+      buySetups.push(i); kOS=dOS=false; osStart=-1;
+    }
+    if(kOB&&dOB&&bear){
+      sellSetups.push(i); kOB=dOB=false; obStart=-1;
+    }
+
+    const crossUp=Number.isFinite(ema[i-1]) && Number.isFinite(ema[i]) &&
+                   closed[i-1].close<=ema[i-1] && closed[i].close>ema[i];
+    const crossDn=Number.isFinite(ema[i-1]) && Number.isFinite(ema[i]) &&
+                   closed[i-1].close>=ema[i-1] && closed[i].close<ema[i];
+
+    for(let x=buySetups.length-1;x>=0;x--){
+      const wait=i-buySetups[x];
+      if(wait<=0) continue;
+      if(wait>maxTo){buySetups.splice(x,1);continue}
+      const trendOK=!useTrend || closed[i].close>trend[i];
+      if(crossUp && trendOK){out.push({i,side:"BUY"});buySetups.splice(x,1)}
+    }
+    for(let x=sellSetups.length-1;x>=0;x--){
+      const wait=i-sellSetups[x];
+      if(wait<=0) continue;
+      if(wait>maxTo){sellSetups.splice(x,1);continue}
+      const trendOK=!useTrend || closed[i].close<trend[i];
+      if(crossDn && trendOK){out.push({i,side:"SELL"});sellSetups.splice(x,1)}
+    }
+  }
+  signals=out.map(s=>({...s,time:closed[s.i].time,price:closed[s.i].close}));
+}
+
+function decodeTrendbar(x){
+  const low=Number(x.low)/100000;
+  return {
+    time:Number(x.utcTimestampInMinutes)*60000,
+    low, open:low+Number(x.deltaOpen)/100000,
+    close:low+Number(x.deltaClose)/100000,
+    high:low+Number(x.deltaHigh)/100000,
+    volume:Number(x.volume||0)
+  };
+}
+function timeframeValue(tf){
+  const m={M1:1,M5:5,M15:11,M30:13,H1:15,H4:18,D1:22};
+  return m[tf]||11;
+}
+function loadBars(){
+  if(!connected || !symbolInfo) return;
+  const period=timeframeValue($("tf").value);
+  getTrendbarList(adapter,{
+    symbolId:Number(symbolInfo.id),
+    period,
+    toTimestamp:Date.now(),
+    count:600,
+    type:0
+  }).pipe(
+    take(1),
+    catchError(err=>{console.error(err);$("status").textContent="Data error";return [];})
+  ).subscribe(res=>{
+    const raw=(res.trendbar||[]).map(decodeTrendbar).filter(x=>x.time>0);
+    raw.sort((a,b)=>a.time-b.time);
+    bars=raw;
+    calculate();
+    draw();
+    $("status").textContent="LIVE";
+    $("info").textContent=`${$("symbol").value} ${$("tf").value} • ${bars.length} bars • last update ${new Date().toLocaleTimeString()}`;
+  });
+}
+function findSymbol(name){
+  const q=name.trim().toUpperCase();
+  return symbols.find(s=>(s.name||"").toUpperCase()===q) ||
+         symbols.find(s=>(s.name||"").toUpperCase().includes(q));
+}
+function loadSymbol(){
+  const s=findSymbol($("symbol").value);
+  if(!s){$("status").textContent="Symbol not found";return}
+  symbolInfo=s;
+  $("symbol").value=s.name;
+  loadBars();
+  clearInterval(timer); timer=setInterval(loadBars,2500);
+}
+
+function resize(){
+  const r=cv.getBoundingClientRect(), dpr=window.devicePixelRatio||1;
+  cv.width=r.width*dpr; cv.height=r.height*dpr; ctx.setTransform(dpr,0,0,dpr,0,0); draw();
+}
+function draw(){
+  const W=cv.clientWidth,H=cv.clientHeight;
+  ctx.clearRect(0,0,W,H);
+  if(!bars.length){ctx.fillStyle="#9aa5af";ctx.fillText("Waiting for cTrader market data…",20,30);return}
+  const data=bars.slice(-140), min=Math.min(...data.map(b=>b.low)), max=Math.max(...data.map(b=>b.high));
+  const pad={l:10,r:70,t:12,b:24}, w=W-pad.l-pad.r,h=H-pad.t-pad.b;
+  const x=i=>pad.l+i*(w/(data.length-1));
+  const y=p=>pad.t+(max-p)/(max-min)*h;
+  ctx.strokeStyle="#20282f";ctx.lineWidth=1;
+  for(let j=0;j<6;j++){const yy=pad.t+j*h/5;ctx.beginPath();ctx.moveTo(pad.l,yy);ctx.lineTo(W-pad.r,yy);ctx.stroke()}
+  const ema=emaSeries(data.map(b=>b.close),n("ema",10));
+  const trend=emaSeries(data.map(b=>b.close),n("trendEma",300));
+  function line(series,dash){
+    ctx.beginPath();let started=false;
+    for(let i=0;i<series.length;i++){if(!Number.isFinite(series[i]))continue;const xx=x(i),yy=y(series[i]);if(!started){ctx.moveTo(xx,yy);started=true}else ctx.lineTo(xx,yy)}
+    ctx.strokeStyle=dash?"#9aa4ad":"#ffd166";ctx.lineWidth=dash?1:1.5;ctx.setLineDash(dash?[5,5]:[]);ctx.stroke();ctx.setLineDash([]);
+  }
+  line(ema,false); line(trend,true);
+
+  const cw=Math.max(2,w/data.length*0.7);
+  data.forEach((b,i)=>{
+    const xx=x(i), yo=y(b.open), yc=y(b.close), yh=y(b.high), yl=y(b.low);
+    ctx.strokeStyle=b.close>=b.open?"#9be7a6":"#ff8b8b";
+    ctx.fillStyle=ctx.strokeStyle;ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(xx,yh);ctx.lineTo(xx,yl);ctx.stroke();
+    const top=Math.min(yo,yc), bh=Math.max(1,Math.abs(yc-yo));ctx.fillRect(xx-cw/2,top,cw,bh);
+  });
+
+  const firstTime=data[0].time, lastTime=data[data.length-1].time;
+  signals.filter(s=>s.time>=firstTime&&s.time<=lastTime).forEach(s=>{
+    const idx=data.findIndex(b=>b.time===s.time); if(idx<0)return;
+    const yy=s.side==="BUY"?y(data[idx].low)-18:y(data[idx].high)+18;
+    ctx.fillStyle=s.side==="BUY"?"#7CFF8B":"#FF6B6B";ctx.strokeStyle=ctx.fillStyle;
+    ctx.beginPath();
+    if(s.side==="BUY"){ctx.moveTo(x(idx),yy-7);ctx.lineTo(x(idx)-7,yy+5);ctx.lineTo(x(idx)+7,yy+5)}
+    else {ctx.moveTo(x(idx),yy+7);ctx.lineTo(x(idx)-7,yy-5);ctx.lineTo(x(idx)+7,yy-5)}
+    ctx.closePath();ctx.fill();
+  });
+
+  ctx.fillStyle="#aeb8c2";ctx.font="12px Arial";
+  ctx.fillText(max.toFixed(symbolInfo?.digits??5),W-pad.r+5,pad.t+8);
+  ctx.fillText(min.toFixed(symbolInfo?.digits??5),W-pad.r+5,H-pad.b);
+  $("buyText").textContent=`BUY: ${signals.filter(s=>s.side==="BUY").length}`;
+  $("sellText").textContent=`SELL: ${signals.filter(s=>s.side==="SELL").length}`;
+}
+
+async function start(){
+  $("status").textContent="Connecting…";
+  handleConfirmEvent(adapter,{}).pipe(take(1)).subscribe();
+  registerEvent(adapter).pipe(
+    take(1),
+    tap(()=>{
+      handleConfirmEvent(adapter,{}).pipe(take(1)).subscribe();
+      connected=true;
+      $("status").textContent="Connected";
+      getLightSymbolList(adapter,{}).pipe(take(1)).subscribe(res=>{
+        symbols=res.symbol||[];
+        loadSymbol();
+      });
+    }),
+    catchError(err=>{console.error(err);$("status").textContent="Connection failed";return [];})
+  ).subscribe();
+}
+$("reload").onclick=loadSymbol;
+$("symbol").addEventListener("change",loadSymbol);
+$("tf").addEventListener("change",loadBars);
+window.addEventListener("resize",resize);
+window.addEventListener("input",()=>{if(bars.length){calculate();draw()}});
+resize(); start();
+</script>
+</body>
+</html>
