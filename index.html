@@ -26,8 +26,9 @@ html,body{margin:0;height:100%;font-family:Arial,Helvetica,sans-serif;background
 </div>
 <script type="module">
 import { createClientAdapter } from "https://esm.sh/@spotware-web-team/sdk-external-api";
-import { handleConfirmEvent, registerEvent, getLightSymbolList, getTrendbarList } from "https://esm.sh/@spotware-web-team/sdk";
-import { take, catchError } from "https://esm.sh/rxjs";
+import { handleConfirmEvent, registerEvent, getLightSymbolList, getTrendbarList, subscribeQuotes, quoteEvent } from "https://esm.sh/@spotware-web-team/sdk";
+import { take, catchError, tap } from "https://esm.sh/rxjs";
+import { createLogger } from "https://esm.sh/@veksa/logger";
 
 const $=id=>document.getElementById(id), cv=$("cv"), ctx=cv.getContext("2d");
 const debug=new URLSearchParams(location.search).has("showLogs"), logBox=$("log");
@@ -43,15 +44,91 @@ let adapter=null,connected=false,symbols=[],symbolInfo=null,bars=[],signals=[],r
 function calculate(){signals=[];rsiSignals=[];if(!bars.length)return;const kp=period("kPeriod",20),slow=period("kSlow",7),dp=period("dPeriod",7),ob=num("ob",80),os=num("os",20),ep=period("ema",10),tep=period("trendEma",300),maxSeq=Math.max(1,Math.floor(num("maxSeq",100))),maxTo=Math.max(1,Math.floor(num("maxEma",100))),useTrend=$("useTrend").value==="1";const closed=bars.slice(0,-1);if(closed.length<Math.max(kp+slow+dp,tep)+5)return;const {k,d}=stochastic(closed,kp,slow,dp),ema=emaSeries(closed.map(b=>b.close),ep),trend=emaSeries(closed.map(b=>b.close),tep);const buys=[],sells=[];let kOS=false,dOS=false,kOB=false,dOB=false,osStart=-1,obStart=-1;for(let i=1;i<closed.length;i++){if(![k[i-1],k[i],d[i-1],d[i]].every(Number.isFinite))continue;if(k[i-1]>os&&k[i]<=os){kOS=true;if(osStart<0)osStart=i}if(d[i-1]>os&&d[i]<=os){dOS=true;if(osStart<0)osStart=i}if(k[i-1]<ob&&k[i]>=ob){kOB=true;if(obStart<0)obStart=i}if(d[i-1]<ob&&d[i]>=ob){dOB=true;if(obStart<0)obStart=i}if(osStart>=0&&i-osStart>maxSeq){kOS=dOS=false;osStart=-1}if(obStart>=0&&i-obStart>maxSeq){kOB=dOB=false;obStart=-1}const bull=k[i-1]<=d[i-1]&&k[i]>d[i],bear=k[i-1]>=d[i-1]&&k[i]<d[i];if(kOS&&dOS&&bull){buys.push(i);kOS=dOS=false;osStart=-1}if(kOB&&dOB&&bear){sells.push(i);kOB=dOB=false;obStart=-1}const up=Number.isFinite(ema[i-1])&&Number.isFinite(ema[i])&&closed[i-1].close<=ema[i-1]&&closed[i].close>ema[i],dn=Number.isFinite(ema[i-1])&&Number.isFinite(ema[i])&&closed[i-1].close>=ema[i-1]&&closed[i].close<ema[i];for(let x=buys.length-1;x>=0;x--){if(i-buys[x]>maxTo){buys.splice(x,1);continue}if(i>buys[x]&&up&&(!useTrend||closed[i].close>trend[i])){signals.push({i,side:"BUY",time:closed[i].time,price:closed[i].close});buys.splice(x,1)}}for(let x=sells.length-1;x>=0;x--){if(i-sells[x]>maxTo){sells.splice(x,1);continue}if(i>sells[x]&&dn&&(!useTrend||closed[i].close<trend[i])){signals.push({i,side:"SELL",time:closed[i].time,price:closed[i].close});sells.splice(x,1)}}}
 if($("rsiEnabled").value==="1"){const rp=period("rsiPeriod",14),rob=num("rsiOb",70),ros=num("rsiOs",30),rep=period("rsiEma",10),rtep=period("rsiTrendEma",300),rmax=Math.max(1,Math.floor(num("rsiMax",100))),rUseTrend=$("rsiUseTrend").value==="1";if(closed.length>Math.max(rp,rep,rtep)+5){const c=closed.map(b=>b.close),r=rsiSeries(c,rp),re=emaSeries(c,rep),rt=emaSeries(c,rtep);let ba=-1,sa=-1;for(let i=1;i<closed.length;i++){if(!Number.isFinite(r[i-1])||!Number.isFinite(r[i]))continue;if(r[i-1]>=ros&&r[i]<ros)ba=i;if(r[i-1]<=rob&&r[i]>rob)sa=i;const up=Number.isFinite(re[i-1])&&Number.isFinite(re[i])&&closed[i-1].close<=re[i-1]&&closed[i].close>re[i],dn=Number.isFinite(re[i-1])&&Number.isFinite(re[i])&&closed[i-1].close>=re[i-1]&&closed[i].close<re[i];if(ba>=0){if(i-ba>rmax)ba=-1;else if(i>ba&&up&&(!rUseTrend||closed[i].close>rt[i])){rsiSignals.push({i,side:"RSI BUY",time:closed[i].time,price:closed[i].close});ba=-1}}if(sa>=0){if(i-sa>rmax)sa=-1;else if(i>sa&&dn&&(!rUseTrend||closed[i].close<rt[i])){rsiSignals.push({i,side:"RSI SELL",time:closed[i].time,price:closed[i].close});sa=-1}}}}}}
 function decodeTrendbar(x){const low=Number(x.low)/100000;return{time:Number(x.utcTimestampInMinutes)*60000,low,open:low+Number(x.deltaOpen)/100000,close:low+Number(x.deltaClose)/100000,high:low+Number(x.deltaHigh)/100000,volume:Number(x.volume||0)}}
-// ProtoTrendbarPeriod values used by cTrader: M1=1, M5=5, M15=7, M30=8, H1=9, H4=10, D1=12.
-function tfValue(tf){return({M1:1,M5:5,M15:7,M30:8,H1:9,H4:10,D1:12})[tf]||7}
+// getTrendbarList uses ProtoTimeframe values:
+// M1=1, M5=5, M15=11, M30=13, H1=15, H4=18, D1=22.
+function tfValue(tf){return({M1:1,M5:5,M15:11,M30:13,H1:15,H4:18,D1:22})[tf]||11}
 function findSymbol(name){const q=name.trim().toUpperCase();return symbols.find(s=>(s.name||"").toUpperCase()===q)||symbols.find(s=>(s.name||"").toUpperCase().includes(q))}
 function loadBars(){if(!connected||!symbolInfo||loading)return;loading=true;$("status").textContent="Loading data…";getTrendbarList(adapter,{symbolId:Number(symbolInfo.id),period:tfValue($("tf").value),toTimestamp:Date.now(),count:1000,type:0}).pipe(take(1),catchError(e=>{log(e);$("status").textContent="Data error";loading=false;return []})).subscribe(res=>{const raw=(res.trendbar||[]).map(decodeTrendbar).filter(b=>b.time>0).sort((a,b)=>a.time-b.time);bars=raw;calculate();draw();loading=false;$("status").textContent="LIVE";$("info").textContent=`${$("symbol").value} ${$("tf").value} • ${bars.length} bars • ${new Date().toLocaleTimeString()}`})}
-function loadSymbol(){if(!connected)return;const s=findSymbol($("symbol").value);if(!s){$("status").textContent="Symbol not found";return}symbolInfo=s;$("symbol").value=s.name;clearInterval(refreshTimer);loadBars();refreshTimer=setInterval(loadBars,5000)}
+function loadSymbol(){
+  if(!connected)return;
+  const s=findSymbol($("symbol").value);
+  if(!s){$("status").textContent="Symbol not found";log("Symbol not found: "+$("symbol").value);return}
+  symbolInfo=s;
+  $("symbol").value=s.name;
+  log(`Using symbol ${s.name} (id=${s.id})`);
+  subscribeQuotes(adapter,{symbolId:[Number(s.id)]}).pipe(
+    take(1),
+    catchError(e=>{log("Quote subscription error: "+JSON.stringify(e));return []})
+  ).subscribe(v=>{if(v)log("Quote subscription accepted")});
+  clearInterval(refreshTimer);
+  loadBars();
+  refreshTimer=setInterval(loadBars,5000);
+}
 function resize(){const r=cv.getBoundingClientRect(),dpr=devicePixelRatio||1;cv.width=Math.max(1,Math.floor(r.width*dpr));cv.height=Math.max(1,Math.floor(r.height*dpr));ctx.setTransform(dpr,0,0,dpr,0,0);draw()}
 function draw(){const W=cv.clientWidth,H=cv.clientHeight;ctx.clearRect(0,0,W,H);if(!bars.length){ctx.fillStyle="#9aa5af";ctx.font="14px Arial";ctx.fillText("Waiting for cTrader market data…",20,30);return}const data=bars.slice(-180),min=Math.min(...data.map(b=>b.low)),max=Math.max(...data.map(b=>b.high)),pad={l:10,r:75,t:12,b:24},w=W-pad.l-pad.r,h=H-pad.t-pad.b,x=i=>pad.l+i*w/Math.max(1,data.length-1),y=p=>pad.t+(max-p)/(max-min||1)*h;ctx.strokeStyle="#20282f";for(let j=0;j<6;j++){const yy=pad.t+j*h/5;ctx.beginPath();ctx.moveTo(pad.l,yy);ctx.lineTo(W-pad.r,yy);ctx.stroke()}function line(series,dash){ctx.beginPath();let started=false;for(let i=0;i<series.length;i++){if(!Number.isFinite(series[i]))continue;const xx=x(i),yy=y(series[i]);if(!started){ctx.moveTo(xx,yy);started=true}else ctx.lineTo(xx,yy)}ctx.strokeStyle=dash?"#9aa4ad":"#ffd166";ctx.lineWidth=dash?1:1.5;ctx.setLineDash(dash?[5,5]:[]);ctx.stroke();ctx.setLineDash([])}line(emaSeries(data.map(b=>b.close),period("ema",10)),false);line(emaSeries(data.map(b=>b.close),period("trendEma",300)),true);const cw=Math.max(2,w/data.length*.7);data.forEach((b,i)=>{const xx=x(i),yo=y(b.open),yc=y(b.close),yh=y(b.high),yl=y(b.low);ctx.strokeStyle=b.close>=b.open?"#9be7a6":"#ff8b8b";ctx.fillStyle=ctx.strokeStyle;ctx.beginPath();ctx.moveTo(xx,yh);ctx.lineTo(xx,yl);ctx.stroke();ctx.fillRect(xx-cw/2,Math.min(yo,yc),cw,Math.max(1,Math.abs(yc-yo)))});function marker(idx,color,up,label){const xx=x(idx),yy=up?y(data[idx].low)-14:y(data[idx].high)+14;ctx.fillStyle=color;ctx.beginPath();if(up){ctx.moveTo(xx,yy-7);ctx.lineTo(xx-7,yy+5);ctx.lineTo(xx+7,yy+5)}else{ctx.moveTo(xx,yy+7);ctx.lineTo(xx-7,yy-5);ctx.lineTo(xx+7,yy-5)}ctx.closePath();ctx.fill();ctx.font="9px Arial";ctx.fillText(label,xx+9,yy+3)}const first=data[0].time,last=data[data.length-1].time;signals.filter(s=>s.time>=first&&s.time<=last).forEach(s=>{const i=data.findIndex(b=>b.time===s.time);if(i>=0)marker(i,s.side==="BUY"?"#7CFF8B":"#FF6B6B",s.side==="BUY",s.side)});rsiSignals.filter(s=>s.time>=first&&s.time<=last).forEach(s=>{const i=data.findIndex(b=>b.time===s.time);if(i>=0)marker(i,s.side==="RSI BUY"?"#00e5ff":"#ff9f43",s.side==="RSI BUY",s.side)});ctx.fillStyle="#aeb8c2";ctx.font="12px Arial";ctx.fillText(max.toFixed(Number.isFinite(symbolInfo?.digits)?symbolInfo.digits:5),W-pad.r+5,pad.t+8);ctx.fillText(min.toFixed(Number.isFinite(symbolInfo?.digits)?symbolInfo.digits:5),W-pad.r+5,H-pad.b);$("buyText").textContent=`BUY: ${signals.filter(s=>s.side==="BUY").length}`;$("sellText").textContent=`SELL: ${signals.filter(s=>s.side==="SELL").length}`;$("rsiBuyText").textContent=`RSI BUY: ${rsiSignals.filter(s=>s.side==="RSI BUY").length}`;$("rsiSellText").textContent=`RSI SELL: ${rsiSignals.filter(s=>s.side==="RSI SELL").length}`}
-async function start(){try{$("status").textContent="Connecting…";adapter=createClientAdapter({});handleConfirmEvent(adapter,{}).pipe(take(1)).subscribe(()=>{log("Initial host confirmation received")});registerEvent(adapter).pipe(take(1),catchError(e=>{log(e);$("status").textContent="Registration failed";return []})).subscribe(()=>{handleConfirmEvent(adapter,{}).pipe(take(1)).subscribe(()=>log("Host confirmed registered event"));connected=true;$("status").textContent="Connected";getLightSymbolList(adapter,{}).pipe(take(1),catchError(e=>{log(e);$("status").textContent="Symbol list error";return []})).subscribe(res=>{symbols=res.symbol||[];log(`Received ${symbols.length} symbols`);loadSymbol()})})}catch(e){console.error(e);log(e);$("status").textContent="SDK error"}}
-$("reload").onclick=loadSymbol;$("symbol").addEventListener("change",loadSymbol);$("tf").addEventListener("change",loadBars);window.addEventListener("resize",resize);window.addEventListener("input",()=>{if(bars.length){calculate();draw()}});resize();start();
+async function start(){
+  try{
+    $("status").textContent="Connecting…";
+    log("Starting cTrader plugin handshake…");
+
+    const logger=createLogger(true);
+    adapter=createClientAdapter({logger});
+    log("SDK adapter created");
+
+    handleConfirmEvent(adapter,{}).pipe(take(1)).subscribe(
+      v=>log("Initial CONFIRM response: "+JSON.stringify(v)),
+      e=>log("Initial CONFIRM error: "+JSON.stringify(e))
+    );
+
+    registerEvent(adapter).pipe(
+      take(1),
+      tap(()=>{
+        log("REGISTER_EVENT accepted by cTrader");
+        handleConfirmEvent(adapter,{}).pipe(take(1)).subscribe(
+          v=>log("Final CONFIRM response: "+JSON.stringify(v)),
+          e=>log("Final CONFIRM error: "+JSON.stringify(e))
+        );
+        connected=true;
+        $("status").textContent="Connected";
+        log("CONNECTED to cTrader host");
+
+        quoteEvent(adapter).subscribe(
+          q=>{log("Quote event received");},
+          e=>log("Quote event error: "+JSON.stringify(e))
+        );
+
+        getLightSymbolList(adapter,{}).pipe(
+          take(1),
+          catchError(e=>{log("Symbol list error: "+JSON.stringify(e));$("status").textContent="Symbol list error";return []})
+        ).subscribe(res=>{
+          symbols=res?.symbol||[];
+          log(`Received ${symbols.length} symbols`);
+          loadSymbol();
+        });
+      }),
+      catchError(e=>{
+        log("REGISTER_EVENT ERROR: "+JSON.stringify(e));
+        $("status").textContent="Host connection failed";
+        return [];
+      })
+    ).subscribe();
+
+    setTimeout(()=>{
+      if(!connected){
+        $("status").textContent="Host timeout";
+        log("No REGISTER_EVENT response after 10 seconds.");
+        log("This means cTrader loaded the page but the SDK handshake is not reaching the cTrader host.");
+      }
+    },10000);
+  }catch(e){
+    console.error(e);
+    log("FATAL SDK ERROR: "+(e?.stack||e?.message||String(e)));
+    $("status").textContent="SDK error";
+  }
+}
+$("reload").onclick=loadSymbol;$("symbol").addEventListener("change",loadSymbol);$("tf").addEventListener("change",loadBars);window.addEventListener("resize",resize);window.addEventListener("input",()=>{if(bars.length){calculate();draw()}});window.addEventListener("error",e=>{log("WINDOW ERROR: "+(e.message||"unknown error"));});
+window.addEventListener("unhandledrejection",e=>{log("UNHANDLED PROMISE: "+(e.reason?.stack||e.reason?.message||String(e.reason)));});
+resize();start();
 </script>
 </body>
 </html>
